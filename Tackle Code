@@ -1,0 +1,382 @@
+#import all the csv files and concatinate the tracking data into one dataframe
+game_data = pd.read_csv('../input/nfl-big-data-bowl-2024/games.csv')
+play_data = pd.read_csv('../input/nfl-big-data-bowl-2024/plays.csv')
+player_data = pd.read_csv('../input/nfl-big-data-bowl-2024/players.csv')
+tackle_data = pd.read_csv('../input/nfl-big-data-bowl-2024/tackles.csv')
+
+tracking_week_1_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_1.csv")
+tracking_week_2_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_2.csv")
+tracking_week_3_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_3.csv")
+tracking_week_4_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_4.csv")
+tracking_week_5_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_5.csv")
+tracking_week_6_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_6.csv")
+tracking_week_7_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_7.csv")
+tracking_week_8_df = pd.read_csv("/kaggle/input/nfl-big-data-bowl-2024/tracking_week_8.csv")
+
+frames = [tracking_week_1_df, tracking_week_2_df, tracking_week_3_df, tracking_week_4_df, tracking_week_5_df, tracking_week_6_df, tracking_week_7_df, tracking_week_8_df]
+tracking_data = pd.concat(frames)
+
+# Drop columns we wont use
+tracking.drop(columns=['jerseyNumber', 'club'], inplace=True)
+
+# Create a new dataframe with 'gamePlayId'
+tracking['gamePlayId'] = tracking[['gameId', 'playId']].astype(str).apply(lambda x: ''.join(x), axis=1)
+tracking['gamePlayId'] = tracking['gamePlayId'].astype('int64')
+
+# Create a new column 'playType' based on conditions
+conditions = [
+    (tracking_playtype['event'].isin(['run', 'handoff'])),
+    (tracking_playtype['event'].isin(['pass_outcome_caught', 'pass']))]
+choices = ['run', 'pass']
+tracking['playType'] = np.select(conditions, choices, default='direct')
+
+# Function to convert height from "feet-inches" to inches
+def height_to_inches(height):
+    feet, inches = map(int, height.split('-'))
+    return feet * 12 + inches
+
+# Applying the height conversion
+player_data['height_inches'] = player_data['height'].apply(height_to_inches)
+
+# Calculating mass 
+# Mass = weight * height in inches
+player_data['mass'] = player_data['weight'] * player_data['height_inches']
+
+player_data.drop(columns=['height', 'weight', 'birthDate', 'collegeName'], inplace=True)
+
+# make a ball carrier column in plays 
+play_data['ball_carrier'] = 1
+
+#tackle_data['gamePlayId'] = tackle_data[['gameId', 'playId']].astype(str).apply(lambda x: ''.join(x), axis=1)
+#tackle_data['gamePlayId'] = tackle_data['gamePlayId'].astype('int64')
+
+#I found Nick Wan's way of merging and isolating the ball carrier features in relation to the defense the most
+#helpful so we use his code for merging and extracting what we want before proceeding further
+
+# merge play_data and tackle_data
+tracking = tracking.merge(play_data.loc[:, ['gameId', 'playId','ballCarrierId','ball_carrier', 'foulName1', 'foulName2', 'foulNFLId1', 'foulNFLId2','absoluteYardlineNumber', 'offenseFormation', 'defendersInTheBox', 'down', 'yardsToGo', 'penaltyYards', 'prePenaltyPlayResult', 'playResult']].rename(columns={'ballCarrierId':'nflId'}), how='left')
+tracking = tracking.merge(tackle_data, how='left')
+
+# fill the tackle column with 0 and change to int 
+tracking['tackle'] = tracking['tackle'].fillna(0).astype(int)
+
+# merge players 
+tracking = tracking.merge(player_data.drop(columns=['displayName'], axis=1), how='left')
+
+# create a tackle attempt column 
+tracking['tackle_attempt'] = tracking.loc[:, ['tackle', 'assist', 'forcedFumble','pff_missedTackle']].sum(axis=1)
+
+# define whether a team was on offense or defense 
+plays = play_data.loc[:, ['gameId', 'playId', 'defensiveTeam']].rename(columns={'defensiveTeam':'club'}).copy()
+plays['on_defense'] = 1
+tracking = tracking.merge(plays, how='left')
+tracking['on_defense'] =tracking['on_defense'].fillna(0).astype(int)
+
+# subset only players on defense
+defense = tracking.loc[tracking['on_defense']==1].copy()
+
+# subset only ball carriers 
+ballcarrier = tracking.loc[tracking['ball_carrier']==1, ['gameId', 'playId', 'frameId', 'x','y', 's','dir']].rename(columns={'x':'bc_x','y':'bc_y','s':'bc_s', 'dir':'bc_dir'})
+
+# merge players on defense and the ball carrier dataframes so one row has information about both a defense player and the ball carrier 
+final_df = defense.merge(ballcarrier)
+
+# create the distance between ball carrier and the defender 
+final_df['bc_dist'] = (((final_df['bc_x'].sub(final_df['x'])).pow(2)).add((final_df['bc_y'].sub(final_df['y'])).pow(2))).pow(0.5)
+final_df.shape
+
+feats = [
+    'x','y','s', 'dir','bc_dist','bc_x','bc_y', 'bc_s', 'bc_dir'
+]
+target = 'tackle'
+
+_______
+
+# drop any rows that have nulls for our model features or target
+model_data = final_df.dropna(subset=feats+[target]).reset_index(drop=True)
+
+# Applying normalization of play direction to model_data
+# Normalizing x and y coordinates
+model_data.loc[model_data['playDirection'] == 'left', 'x'] = 120 - model_data['x']
+model_data.loc[model_data['playDirection'] == 'left', 'y'] = (160 / 3) - model_data['y']
+
+# Normalizing 'dir' and 'bc_dir' (direction and ball carrier direction)
+model_data.loc[(model_data['playDirection'] == 'left') & (model_data['dir'] < 180), 'dir'] = model_data['dir'] + 180
+model_data.loc[(model_data['playDirection'] == 'left') & (model_data['dir'] >= 180), 'dir'] = model_data['dir'] - 180
+model_data.loc[(model_data['playDirection'] == 'left') & (model_data['bc_dir'] < 180), 'bc_dir'] = model_data['bc_dir'] + 180
+model_data.loc[(model_data['playDirection'] == 'left') & (model_data['bc_dir'] >= 180), 'bc_dir'] = model_data['bc_dir'] - 180
+
+# Setting all play directions to 'right'
+model_data['playDirection'] = 'right'
+
+# Check the first few rows to confirm changes
+model_data_normalized_head = model_data.head()
+model_data_normalized_head
+
+______
+
+# Calculating Momentum for each player and adding it as a new column
+model_data['momentum'] = model_data['mass'] * model_data['s']
+
+# Checking the first few rows to confirm the addition of the 'momentum' column
+model_data_momentum_head = model_data.head()
+model_data_momentum_head, model_data.shape
+
+______
+
+# Assumption: The frame rate of the data is consistent and time is recorded in seconds
+# Adding a column for the change in speed between consecutive frames for each player
+model_data['delta_s'] = model_data.groupby(['gameId', 'playId', 'nflId'])['s'].diff().fillna(0)
+
+# Adding a column for the time difference between consecutive frames
+# Assuming time is recorded in a standard format, converting it to seconds for calculation
+time_format = "%M:%S.%f"
+model_data['time_seconds'] = pd.to_datetime(model_data['time'], format=time_format).dt.second + pd.to_datetime(model_data['time'], format=time_format).dt.microsecond * 1e-6
+model_data['delta_time'] = model_data.groupby(['gameId', 'playId', 'nflId'])['time_seconds'].diff().fillna(0)
+
+# Estimating acceleration (delta speed / delta time) and handling division by zero
+# In cases where delta time is 0, acceleration is set to 0
+model_data['acceleration'] = model_data['delta_s'] / model_data['delta_time']
+model_data['acceleration'] = model_data['acceleration'].fillna(0)
+
+# Calculating force as mass * acceleration
+model_data['force'] = model_data['mass'] * model_data['acceleration']
+
+# Check the first few rows to confirm the addition of the 'force' column
+model_data_force_head = model_data.head()
+model_data_force_head, model_data.shape
+
+________
+
+# Recalculating force using the provided acceleration data in the 'a' column
+model_data['force'] = model_data['mass'] * model_data['a']
+
+# Check the first few rows to confirm the recalculation of the 'force' column
+model_data_force_recalculated_head = model_data.head()
+model_data_force_recalculated_head, model_data.shape
+
+__________
+
+def angular_difference(angle1, angle2):
+    """
+    Calculate the absolute difference between two angles.
+    The function handles the circular nature of angles.
+    """
+    return 180 - abs(abs(angle1 - angle2) - 180)
+
+# Calculate the Ball Direction Variance
+# Assuming 'dir' is the direction of the defensive player and 'bc_dir' is the direction of the ball carrier
+model_data['ball_direction_variance'] = model_data.apply(lambda row: angular_difference(row['dir'], row['bc_dir']), axis=1)
+
+# Check the first few rows to confirm the addition of the 'ball_direction_variance' column
+model_data_ball_dir_variance_head = model_data.head()
+model_data_ball_dir_variance_head, model_data.shape
+
+_________
+
+# Calculating the x and y components of the directional velocity
+# Converting direction from degrees to radians for the trigonometric functions
+model_data['dir_rad'] = np.deg2rad(model_data['dir'])
+
+# x component of the velocity
+model_data['velocity_x'] = model_data['s'] * np.cos(model_data['dir_rad'])
+
+# y component of the velocity
+model_data['velocity_y'] = model_data['s'] * np.sin(model_data['dir_rad'])
+
+# Check the first few rows to confirm the addition of the 'velocity_x' and 'velocity_y' columns
+model_data_directional_velocity_head = model_data.head()
+model_data_directional_velocity_head, model_data.shape
+
+_______
+
+# Calculating the Momentum Vector as the product of Momentum and Ball Direction Variance
+model_data['momentum_vector'] = model_data['momentum'] * model_data['ball_direction_variance']
+
+# Check the first few rows to confirm the addition of the 'momentum_vector' column
+model_data_momentum_vector_head = model_data.head()
+model_data_momentum_vector_head, model_data.shape
+
+_______
+
+# Calculating the Force Vector as the product of Force and Ball Direction Variance
+model_data['force_vector'] = model_data['force'] * model_data['ball_direction_variance']
+
+# Check the first few rows to confirm the addition of the 'force_vector' column
+model_data_force_vector_head = model_data.head()
+model_data_force_vector_head, model_data.shape
+
+_________
+
+# Calculating the Euclidean distance to the ball carrier
+model_data['distance_to_ball_carrier'] = np.sqrt((model_data['x'] - model_data['bc_x'])**2 + (model_data['y'] - model_data['bc_y'])**2)
+
+# Check the first few rows to confirm the addition of the 'distance_to_ball_carrier' column
+model_data_distance_to_ball_carrier_head = model_data.head()
+model_data_distance_to_ball_carrier_head, model_data.shape
+
+_________
+
+# Calculating the vector components from each player to the ball carrier
+model_data['vector_to_bc_x'] = model_data['bc_x'] - model_data['x']
+model_data['vector_to_bc_y'] = model_data['bc_y'] - model_data['y']
+
+# Calculating the magnitude of the vector to the ball carrier
+model_data['vector_to_bc_magnitude'] = np.sqrt(model_data['vector_to_bc_x']**2 + model_data['vector_to_bc_y']**2)
+
+# Calculating the dot product of the player's velocity vector and the vector to the ball carrier
+model_data['dot_product_velocity_vector_to_bc'] = (model_data['velocity_x'] * model_data['vector_to_bc_x']) + (model_data['velocity_y'] * model_data['vector_to_bc_y'])
+
+# Calculating the projection (relative speed towards the ball carrier)
+# Avoid division by zero by replacing zero magnitudes with a very small number
+model_data['relative_speed_towards_bc'] = model_data['dot_product_velocity_vector_to_bc'] / model_data['vector_to_bc_magnitude'].replace(0, 1e-9)
+
+# Check the first few rows to confirm the addition of the 'relative_speed_towards_bc' column
+model_data_relative_speed_towards_bc_head = model_data.head()
+model_data_relative_speed_towards_bc_head, model_data.shape
+
+# Calculating Time to Tackle
+# Avoid division by zero or negative speeds by setting time to a very large number in such cases
+model_data['time_to_tackle'] = model_data['distance_to_ball_carrier'] / model_data['relative_speed_towards_bc']
+model_data['time_to_tackle'] = model_data['time_to_tackle'].apply(lambda x: x if x > 0 else float('inf'))
+
+# Check the first few rows to confirm the addition of the 'time_to_tackle' column
+model_data_time_to_tackle_head = model_data.head()
+model_data_time_to_tackle_head, model_data.shape
+
+___________
+
+# Calculating the change in distance to the ball carrier for each defender between consecutive frames
+model_data['delta_distance_to_bc'] = model_data.groupby(['gameId', 'playId', 'nflId'])['distance_to_ball_carrier'].diff().fillna(0)
+
+# Taking the average of these differences for each gameId and playId combination
+# Negative values indicate closing in on the ball carrier, so we only consider negative changes
+defender_convergence = model_data[model_data['delta_distance_to_bc'] < 0].groupby(['gameId', 'playId'])['delta_distance_to_bc'].mean().reset_index()
+defender_convergence.rename(columns={'delta_distance_to_bc': 'average_convergence'}, inplace=True)
+
+# Merging this average convergence back into the original model_data
+model_data = model_data.merge(defender_convergence, on=['gameId', 'playId'], how='left')
+
+# Fill NaN values with 0 for plays where no convergence is happening
+model_data['average_convergence'] = model_data['average_convergence'].fillna(0)
+
+# Check the first few rows to confirm the addition of the 'average_convergence' column
+model_data_average_convergence_head = model_data.head()
+model_data_average_convergence_head, model_data.shape
+
+_______
+
+# Calculating Time to Contact
+# Avoid division by zero by setting time to a very large number in such cases
+model_data['time_to_contact'] = model_data['distance_to_ball_carrier'] / model_data['s'].replace(0, 1e-9)
+
+# Check the first few rows to confirm the addition of the 'time_to_contact' column
+model_data_time_to_contact_head = model_data.head()
+model_data_time_to_contact_head, model_data.shape
+
+________
+# Define the radius within which defenders are considered to be exerting pressure (in yards)
+#pressure_radius = 5  
+
+# Calculate whether each defender is within the pressure radius of the ball carrier
+model_data['within_pressure_radius'] = model_data['distance_to_ball_carrier'].apply(lambda x: x <= pressure_radius)
+
+# Counting the number of defenders within the pressure radius for each gameId and playId
+defensive_density = model_data.groupby(['gameId', 'playId'])['within_pressure_radius'].sum().reset_index()
+defensive_density.rename(columns={'within_pressure_radius': 'defensive_density'}, inplace=True)
+
+# Merging this defensive density back into the original model_data
+model_data = model_data.drop(columns='defensive_density', errors='ignore')  # Remove old defensive_density column if exists
+model_data = model_data.merge(defensive_density, on=['gameId', 'playId'], how='left')
+
+# Check the first few rows to confirm the change
+model_data_defensive_density_updated_head = model_data.head()
+model_data_defensive_density_updated_head, model_data.shape
+
+_______
+
+# Calculating the change in speed (Change in Velocity) between consecutive frames for each defender
+model_data['change_in_velocity'] = model_data.groupby(['gameId', 'playId', 'nflId'])['s'].diff().fillna(0)
+
+# Check the first few rows to confirm the addition of the 'change_in_velocity' column
+model_data_change_in_velocity_head = model_data.head()
+model_data_change_in_velocity_head, model_data.shape
+
+_________
+
+# Calculating the change in x and y components of velocity for each player and the ball carrier
+model_data['delta_velocity_x'] = model_data.groupby(['gameId', 'playId', 'nflId'])['velocity_x'].diff().fillna(0)
+model_data['delta_velocity_y'] = model_data.groupby(['gameId', 'playId', 'nflId'])['velocity_y'].diff().fillna(0)
+
+# Calculating the change in x and y components of velocity for the ball carrier
+model_data['delta_bc_velocity_x'] = model_data.groupby(['gameId', 'playId'])['bc_x'].diff().fillna(0)
+model_data['delta_bc_velocity_y'] = model_data.groupby(['gameId', 'playId'])['bc_y'].diff().fillna(0)
+
+# Computing the difference in these changes for each player relative to the ball carrier
+model_data['relative_velocity_x'] = model_data['delta_velocity_x'] - model_data['delta_bc_velocity_x']
+model_data['relative_velocity_y'] = model_data['delta_velocity_y'] - model_data['delta_bc_velocity_y']
+
+# Combining the x and y components to get the magnitude of the relative velocity
+model_data['relative_velocity'] = np.sqrt(model_data['relative_velocity_x']**2 + model_data['relative_velocity_y']**2)
+
+# Check the first few rows to confirm the addition of the 'relative_velocity' column
+model_data_relative_velocity_head = model_data.head()
+model_data_relative_velocity_head, model_data.shape
+
+_________
+
+# Identifying the frames where "tackle" or "first_contact" events occur
+tackle_frames = model_data[(model_data['event'] == 'tackle') | (model_data['event'] == 'first_contact')]
+
+# For each of these frames, identify the defenders involved in the tackle or assist
+# We consider a player involved if they have a 1 in either 'assist', 'tackle', or 'pff_missedTackle' columns
+involved_defenders = tackle_frames[(tackle_frames['assist'] == 1) | (tackle_frames['tackle'] == 1) | (tackle_frames['pff_missedTackle'] == 1)]
+
+# Extracting the speed ('s') of these defenders in these frames as the Impact Velocity
+involved_defenders['impact_velocity'] = involved_defenders['s']
+
+# Merging this information back into the original model_data
+model_data = model_data.merge(involved_defenders[['gameId', 'playId', 'nflId', 'impact_velocity']], on=['gameId', 'playId', 'nflId'], how='left')
+
+# Fill NaN values with 0 for players not involved in tackles
+model_data['impact_velocity'] = model_data['impact_velocity'].fillna(0)
+
+# Check the first few rows to confirm the addition of the 'impact_velocity' column
+model_data_impact_velocity_head = model_data.head()
+model_data_impact_velocity_head, model_data.shape
+
+_________
+
+# Step 1: Calculate the total distance moved by each player in both x and y coordinates across all frames
+
+# Calculating the change in x and y positions for each player between consecutive frames
+model_data['delta_x'] = model_data.groupby(['gameId', 'playId', 'nflId'])['x'].diff().fillna(0)
+model_data['delta_y'] = model_data.groupby(['gameId', 'playId', 'nflId'])['y'].diff().fillna(0)
+
+# Calculating the total distance moved (Euclidean distance) in each frame
+model_data['frame_distance'] = np.sqrt(model_data['delta_x']**2 + model_data['delta_y']**2)
+
+# Aggregating the total distance moved by each player across all frames
+total_distance_moved = model_data.groupby(['gameId', 'playId', 'nflId'])['frame_distance'].sum().reset_index()
+total_distance_moved.rename(columns={'frame_distance': 'total_distance_moved'}, inplace=True)
+
+# Now, we proceed to step 2 and 3: identifying frames for specific events and filtering the total distance data
+# Identifying the frames corresponding to specific events
+specific_events = model_data[model_data['event_renamed'].isin(events_of_interest)].copy()
+
+# Merging the total distance data with the specific events data
+specific_events_distance = specific_events.merge(total_distance_moved, on=['gameId', 'playId', 'nflId'])
+
+# Showing the total distance moved by players at specific events for demonstration
+specific_events_distance[['gameId', 'playId', 'nflId', 'event_renamed', 'total_distance_moved']].head()
+
+_______
+
+# Merging the specific events distance data back into the model_data dataframe
+model_data = model_data.merge(specific_events_distance[['gameId', 'playId', 'nflId', 'event_renamed', 'total_distance_moved']], 
+                              on=['gameId', 'playId', 'nflId'], 
+                              how='left')
+
+# Check the first few rows to confirm the merge
+model_data_merged_head = model_data.head()
+model_data_merged_head[['gameId', 'playId', 'nflId', 'event', 'event_renamed', 'total_distance_moved']], model_data.shape
